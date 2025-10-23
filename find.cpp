@@ -35,6 +35,12 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <regex>
 #include <string>
 
+#include <condition_variable>
+#include <functional>
+#include <future>
+#include <queue>
+#include <mutex>
+
 namespace fs = std::filesystem;
 
 struct error_code {
@@ -145,7 +151,8 @@ private:
 };
 
 struct finder {
-public:
+
+private:
 
   struct type_filter {
     enum kind : int {
@@ -306,9 +313,19 @@ public:
 
       return obj;
     }
-  } params_m;
+  } m_params;
 
-  finder(params params) noexcept : params_m{ std::move(params) } {}
+  std::mutex m_mtx;
+
+  std::condition_variable m_cv;
+
+  std::queue<fs::directory_entry> m_queue;
+
+  std::vector<std::future<void>> m_tasks;
+
+public:
+
+  finder(params params) noexcept : m_params{ std::move(params) } {}
 
   static auto make(params params) noexcept -> finder { return std::move(params); }
 
@@ -318,23 +335,31 @@ public:
     return params::from(opts).transform(make);
   }
 
-  auto run() const noexcept
+  auto run() noexcept
     -> std::expected<int, error_code>
   {
-    if (!params_m.path)
+    if (!m_params.path)
       return make_unexpected(error_code::path_absent);
 
-    if (!fs::exists(*params_m.path))
+    if (!fs::exists(*m_params.path))
       return make_unexpected(error_code::path_not_exist);
 
-    if (!fs::is_directory(*params_m.path))
+    if (!fs::is_directory(*m_params.path))
       return make_unexpected(error_code::path_not_dir);
 
-    // iterate path
+    visit(*m_params.path);
 
-    visit(*params_m.path);
+    // start the main thread
 
-    return EXIT_SUCCESS;
+    auto task = std::packaged_task<int(finder*)>{ &finder::thread };
+
+    auto result = task.get_future();
+
+    auto thread = std::thread(std::move(task), this);
+
+    thread.join();
+
+    return result.get();
   }
 
   static auto handle_err(error_code ec)
@@ -345,24 +370,53 @@ public:
     return ec.value();
   }
 
+  int thread() {
+    while (true) {
+      // wait to start next task or clean up tasks done
+
+      std::unique_lock lck{ m_mtx };
+
+      m_cv.wait(lck, [&]() { return m_tasks.size() != 0 || m_queue.size() != 0; });
+
+      // clean up terminated tasks
+
+      for (auto it = m_tasks.begin(); it != m_tasks.end();) {
+        if (it->wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
+          ++it;
+
+          continue;
+        }
+
+        it = m_tasks.erase(it);
+      }
+
+      if (m_queue.size() == 0)
+        if (m_tasks.size() == 0)
+          break;
+        else
+          continue;
+
+      // get the job and start an async task
+
+      auto& job = m_queue.front();
+
+      m_tasks.push_back(std::async(std::launch::async, &finder::run_visit, this, std::move(job)));
+
+      m_queue.pop();
+    }
+
+    return EXIT_SUCCESS;
+  }
+
 private:
-
-  inline auto after_filtering(const fs::directory_entry& entry) const noexcept {
-    return shall_print(entry) ? std::make_optional(entry) : std::nullopt;
-  }
-
-  inline void print_entry(std::optional<fs::directory_entry> entry) const noexcept {
-    if (entry)
-      std::cout << entry->path().native() << "\n";
-  }
 
   bool shall_print(const fs::directory_entry& entry) const noexcept {
     bool res = true;
 
     // filter by type
 
-    if (params_m.type)
-      switch (params_m.type->value) {
+    if (m_params.type)
+      switch (m_params.type->value) {
 
       case type_filter::directories:
         res = entry.is_directory();
@@ -376,31 +430,54 @@ private:
       }
 
     // filter by name
-    if (params_m.name)
-      res = res && std::regex_match(entry.path().filename().native(), *params_m.name);
+
+    if (m_params.name)
+      res = res && std::regex_match(entry.path().filename().native(), *m_params.name);
 
     // filter by iname
-    if (params_m.iname)
-      res = res && std::regex_match(entry.path().filename().native(), *params_m.iname);
+
+    if (m_params.iname)
+      res = res && std::regex_match(entry.path().filename().native(), *m_params.iname);
 
     return res;
   }
 
-  inline void visit(fs::path dir_path) const { visit(fs::directory_entry{ dir_path }); }
+  inline void print_entry(const fs::directory_entry& entry) noexcept {
+    if (!shall_print(entry))
+      return;
 
-  void visit(fs::directory_entry entry) const {
+    std::lock_guard guard{ m_mtx };
+
+    std::cout << entry.path().native() << "\n";
+  }
+
+  inline void visit(const fs::path& dir_path) { visit(fs::directory_entry{ dir_path }); }
+
+  inline void visit(const fs::directory_entry& entry) { queue_visit(entry); } // async
+
+  //inline void visit(const fs::directory_entry& entry) { run_visit(entry); } // sync
+
+  void queue_visit(const fs::directory_entry& entry) {
+    std::lock_guard guard{ m_mtx };
+
+    m_queue.push(entry);
+
+    m_cv.notify_one();
+  }
+
+  void run_visit(const fs::directory_entry& entry) {
     if (entry.is_symlink())
       return;
 
-    print_entry(after_filtering(entry));
+    print_entry(entry);
 
     auto it = fs::directory_iterator(entry, fs::directory_options::skip_permission_denied);
 
-    for (const auto& e : it)
+    for (auto& e : it)
       if (e.is_directory())
-        visit(e.path());
+        visit(e);
       else
-        print_entry(after_filtering(e));
+        print_entry(e);
   }
 };
 
