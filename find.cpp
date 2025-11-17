@@ -43,6 +43,14 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 namespace fs = std::filesystem;
 
+template<typename... Args>
+void err(std::format_string<Args...> fmt, Args&&... args) {
+  std::cerr
+    << "ERROR: "
+    << std::format(fmt, std::forward<Args&&...>(args)...)
+    << std::endl;
+}
+
 struct error_code {
   enum kind : int {
 
@@ -75,6 +83,14 @@ struct error_code {
     return m_code;
   }
 
+  auto handle_err() const
+    -> std::expected<int, error_code>
+  {
+    err("{}", message().c_str());
+
+    return value();
+  }
+
 private:
   std::string default_msg() const {
     switch (m_code) {
@@ -94,14 +110,6 @@ private:
 
 static inline auto make_unexpected(error_code::kind c, std::optional<std::string> m = {}) {
   return std::unexpected{ error_code{ c, m } };
-}
-
-template<typename... Args>
-void err(std::format_string<Args...> fmt, Args&&... args) {
-  std::cerr
-    << "ERROR: "
-    << std::format(fmt, std::forward<Args&&...>(args)...)
-    << std::endl;
 }
 
 struct opts {
@@ -362,14 +370,6 @@ public:
     return result.get();
   }
 
-  static auto handle_err(error_code ec)
-    -> std::expected<int, error_code>
-  {
-    err("{}", ec.message().c_str());
-
-    return ec.value();
-  }
-
   int thread() {
     while (true) {
       // wait to start next task or clean up tasks done
@@ -484,6 +484,6 @@ private:
 int main(const int argc, const char** argv) {
   return finder::from({ argc, argv })
     .and_then(&finder::run)
-    .or_else(finder::handle_err)
+    .or_else(&error_code::handle_err)
     .value();
 }
