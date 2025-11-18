@@ -27,6 +27,7 @@ ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
+#include <cstdlib>
 #include <expected>
 #include <filesystem>
 #include <format>
@@ -84,11 +85,11 @@ struct error_code {
   }
 
   auto handle_err() const
-    -> std::expected<int, error_code>
+    -> std::expected<void, int>
   {
     err("{}", message().c_str());
 
-    return value();
+    return std::unexpected{ value() };
   }
 
 private:
@@ -344,7 +345,7 @@ public:
   }
 
   auto run() noexcept
-    -> std::expected<int, error_code>
+    -> std::expected<void, error_code>
   {
     if (!m_params.path)
       return make_unexpected(error_code::path_absent);
@@ -359,53 +360,55 @@ public:
 
     // start the main thread
 
-    auto task = std::packaged_task<int(finder*)>{ &finder::thread };
+    auto task = std::packaged_task{ &finder::thread };
 
     auto result = task.get_future();
 
-    auto thread = std::thread(std::move(task), this);
+    auto thread = std::thread(std::move(task), std::ref(*this));
 
     thread.join();
 
     return result.get();
   }
 
-  int thread() {
+  auto thread(this finder& self)
+    -> std::expected<void, error_code>
+  {
     while (true) {
       // wait to start next task or clean up tasks done
 
-      std::unique_lock lck{ m_mtx };
+      std::unique_lock lck{ self.m_mtx };
 
-      m_cv.wait(lck, [&]() { return m_tasks.size() != 0 || m_queue.size() != 0; });
+      self.m_cv.wait(lck, [&]() { return self.m_tasks.size() != 0 || self.m_queue.size() != 0; });
 
       // clean up terminated tasks
 
-      for (auto it = m_tasks.begin(); it != m_tasks.end();) {
+      for (auto it = self.m_tasks.begin(); it != self.m_tasks.end();) {
         if (it->wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
           ++it;
 
           continue;
         }
 
-        it = m_tasks.erase(it);
+        it = self.m_tasks.erase(it);
       }
 
-      if (m_queue.size() == 0)
-        if (m_tasks.size() == 0)
+      if (self.m_queue.size() == 0)
+        if (self.m_tasks.size() == 0)
           break;
         else
           continue;
 
       // get the job and start an async task
 
-      auto& job = m_queue.front();
+      auto& job = self.m_queue.front();
 
-      m_tasks.push_back(std::async(std::launch::async, &finder::run_visit, this, std::move(job)));
+      self.m_tasks.push_back(std::async(&finder::run_visit, &self, std::move(job)));
 
-      m_queue.pop();
+      self.m_queue.pop();
     }
 
-    return EXIT_SUCCESS;
+    return {};
   }
 
 private:
@@ -485,5 +488,6 @@ int main(const int argc, const char** argv) {
   return finder::from({ argc, argv })
     .and_then(&finder::run)
     .or_else(&error_code::handle_err)
-    .value();
+    .error_or(EXIT_SUCCESS);
+}
 }
